@@ -1,0 +1,57 @@
+################################################################################
+# mod-class-balance – Ajuste de multiplicadores de combate por clase
+################################################################################
+# Versión: 1.0.0
+#
+# Permite ajustar el daño dado, el daño recibido y la curación de cada clase
+# de jugador de forma independiente, en caliente, mediante comandos de GM
+# o editando directamente la tabla `mod_class_balance` de acore_world.
+#
+# Los valores se almacenan en la base de datos (mod_class_balance).
+# Este archivo solo controla si el módulo está activo.
+#
+# Comandos disponibles (requieren nivel GM):
+#   .classbalance list               – Muestra todos los multiplicadores
+#   .classbalance info <clase>       – Detalle de una clase
+#   .classbalance set <clase> <tipo> <valor>
+#                                    – Ajusta un multiplicador (live + BD)
+#                                      tipos: phys | spell | heal | def
+#   .classbalance reset <clase>      – Resetea clase a 1.0
+#   .classbalance reload             – Recarga todos los valores desde la BD
+#
+# Ejemplos:
+#   .classbalance set warrior phys 1.15    → +15% daño físico a Guerreros
+#   .classbalance set mage spell 0.90      → -10% daño hechizo a Magos
+#   .classbalance set paladin heal 1.10    → +10% curación de Paladines
+#   .classbalance set priest def 0.85      → Sacerdotes reciben 15% menos daño
+#
+# Clases válidas (inglés o español):
+#   warrior/guerrero, paladin, hunter/cazador, rogue/picaro,
+#   priest/sacerdote, deathknight/dk, shaman/chaman,
+#   mage/mago, warlock/brujo, druid/druida
+################################################################################
+
+[worldserver]
+
+#
+# ClassBalance.Enable
+#   Activa o desactiva el módulo.
+#   Predeterminado: 1 (activado)
+#
+ClassBalance.Enable = 1
+
+#
+# ClassBalance.ApplyInPvP
+#   Aplica los multiplicadores también en combate JcJ (jugador vs jugador).
+#   Si se desactiva, los modificadores solo afectan a daño contra NPCs/criaturas.
+#   Predeterminado: 1 (activado)
+#
+ClassBalance.ApplyInPvP = 1
+
+#
+# ClassBalance.ApplyInPvE
+#   Aplica los multiplicadores en combate JcE (jugador vs entorno/NPCs).
+#   Predeterminado: 1 (activado)
+#
+ClassBalance.ApplyInPvE = 1
+
