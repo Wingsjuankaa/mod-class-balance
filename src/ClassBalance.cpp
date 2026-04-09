@@ -15,10 +15,17 @@
 // ─── Multiplicadores por clase ────────────────────────────────────────────────
 struct ClassMultipliers
 {
-    float physDmg  = 1.0f;  // Daño físico (melee/ranged) dado
-    float spellDmg = 1.0f;  // Daño de hechizo y DoTs dado
-    float healing  = 1.0f;  // Curación hecha
-    float defense  = 1.0f;  // Daño recibido (todas las fuentes); 0.9 = 10% menos
+    float physDmg  = 1.0f;
+    float spellDmg = 1.0f;
+    float healing  = 1.0f;
+    float defense  = 1.0f;
+};
+
+// ─── Multiplicadores por hechizo específico ───────────────────────────────────
+struct SpellMultiplier
+{
+    float dmgMult  = 1.0f;  // Daño (spell damage y DoTs) del hechizo
+    float healMult = 1.0f;  // Curación del hechizo
 };
 
 // ─── Manager ──────────────────────────────────────────────────────────────────
@@ -149,6 +156,46 @@ public:
         while (result->NextRow());
 
         LOG_INFO("module", "ClassBalance: {} clase(s) cargadas.", count);
+
+        // Cargar también los overrides por hechizo
+        LoadAllSpells();
+    }
+
+    // ── Carga hechizos específicos desde la BD ────────────────────────────────
+    void LoadAllSpells()
+    {
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _spellMults.clear();
+        }
+
+        QueryResult result = WorldDatabase.Query(
+            "SELECT `spell_id`, `dmg_mult`, `heal_mult` "
+            "FROM `mod_class_balance_spells`");
+
+        if (!result)
+        {
+            LOG_INFO("module", "ClassBalance: Tabla mod_class_balance_spells vacía o sin filas.");
+            return;
+        }
+
+        uint32 count = 0;
+        do
+        {
+            Field* f = result->Fetch();
+            uint32 spellId = f[0].Get<uint32>();
+            SpellMultiplier m;
+            m.dmgMult  = f[1].Get<float>();
+            m.healMult = f[2].Get<float>();
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                _spellMults[spellId] = m;
+            }
+            ++count;
+        }
+        while (result->NextRow());
+
+        LOG_INFO("module", "ClassBalance: {} hechizo(s) con override cargados.", count);
     }
 
     // ── Ajusta un multiplicador, guarda en BD y actualiza caché ───────────────
@@ -218,9 +265,67 @@ public:
         return true;
     }
 
+    // ── Obtener multiplicador de un hechizo específico ────────────────────────
+    SpellMultiplier GetSpellMult(uint32 spellId) const
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _spellMults.find(spellId);
+        if (it != _spellMults.end())
+            return it->second;
+        return SpellMultiplier{};
+    }
+
+    // ── Ajusta un multiplicador de hechizo, guarda en BD y actualiza caché ───
+    // type: "dmg" | "heal"
+    bool SetSpellMultiplier(uint32 spellId, std::string const& type, float value)
+    {
+        if (spellId == 0 || value < 0.0f || value > 100.0f)
+            return false;
+
+        std::string t = type;
+        std::transform(t.begin(), t.end(), t.begin(), ::tolower);
+
+        std::string column;
+        if (t == "dmg"  || t == "damage" || t == "daño" || t == "dano"
+                        || t == "hechizo" || t == "spell")
+            column = "dmg_mult";
+        else if (t == "heal" || t == "cura" || t == "curacion" || t == "curación")
+            column = "heal_mult";
+        else
+            return false;
+
+        WorldDatabase.DirectExecute(
+            "INSERT INTO `mod_class_balance_spells` "
+            "(`spell_id`,`dmg_mult`,`heal_mult`) "
+            "VALUES ({},1.0,1.0) "
+            "ON DUPLICATE KEY UPDATE `{}` = {}",
+            spellId, column, value);
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            auto& m = _spellMults[spellId];
+            if (column == "dmg_mult")  m.dmgMult  = value;
+            if (column == "heal_mult") m.healMult = value;
+        }
+        return true;
+    }
+
+    // ── Elimina el override de un hechizo específico ──────────────────────────
+    void ResetSpell(uint32 spellId)
+    {
+        WorldDatabase.DirectExecute(
+            "DELETE FROM `mod_class_balance_spells` WHERE `spell_id`={}",
+            spellId);
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _spellMults.erase(spellId);
+        }
+    }
+
 private:
     mutable std::mutex _mutex;
-    std::unordered_map<uint8, ClassMultipliers> _mults;
+    std::unordered_map<uint8,  ClassMultipliers> _mults;
+    std::unordered_map<uint32, SpellMultiplier>  _spellMults;
 };
 
 #define sClassBalance ClassBalanceMgr::instance()
@@ -273,7 +378,7 @@ public:
 
     // ── Daño de hechizo ───────────────────────────────────────────────────────
     void ModifySpellDamageTaken(Unit* target, Unit* attacker,
-                                int32& damage, SpellInfo const* /*spellInfo*/) override
+                                int32& damage, SpellInfo const* spellInfo) override
     {
         if (!ClassBalanceMgr::IsEnabled() || damage <= 0)
             return;
@@ -288,15 +393,22 @@ public:
         if (target && target->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(target->getClass()).defense;
 
+        // Override por hechizo específico (se apila con el multiplicador de clase)
+        if (spellInfo)
+        {
+            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
+            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
+                mult *= spellSpecific;
+        }
+
         if (std::fabs(mult - 1.0f) > 0.001f)
             damage = static_cast<int32>(static_cast<float>(damage) * mult);
     }
 
     // ── Daño periódico (DoTs) ─────────────────────────────────────────────────
-    // attacker puede ser nullptr si despawnó mientras el aura sigue activa
     void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker,
                                        uint32& damage,
-                                       SpellInfo const* /*spellInfo*/) override
+                                       SpellInfo const* spellInfo) override
     {
         if (!ClassBalanceMgr::IsEnabled() || damage == 0)
             return;
@@ -311,25 +423,38 @@ public:
         if (target && target->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(target->getClass()).defense;
 
+        // Override por hechizo específico
+        if (spellInfo)
+        {
+            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
+            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
+                mult *= spellSpecific;
+        }
+
         if (std::fabs(mult - 1.0f) > 0.001f)
             damage = static_cast<uint32>(static_cast<float>(damage) * mult);
     }
 
     // ── Curación ──────────────────────────────────────────────────────────────
     void ModifyHealReceived(Unit* target, Unit* healer,
-                            uint32& heal, SpellInfo const* /*spellInfo*/) override
+                            uint32& heal, SpellInfo const* spellInfo) override
     {
         if (!ClassBalanceMgr::IsEnabled() || heal == 0)
             return;
 
         float mult = 1.0f;
 
-        // Solo el sanador necesita ser jugador para que aplique su multiplicador
         if (healer && healer->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(healer->getClass()).healing;
 
-        // También podría haber un "defense vs healing" en el objetivo, pero
-        // por ahora solo escalamos el output del sanador.
+        // Override por hechizo específico
+        if (spellInfo)
+        {
+            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).healMult;
+            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
+                mult *= spellSpecific;
+        }
+
         if (std::fabs(mult - 1.0f) > 0.001f)
             heal = static_cast<uint32>(static_cast<float>(heal) * mult);
     }
@@ -341,6 +466,10 @@ public:
 // .classbalance set <clase> <tipo> <valor>
 // .classbalance reset <clase>
 // .classbalance reload
+// .classbalance spell list
+// .classbalance spell info <spell_id>
+// .classbalance spell set <spell_id> <dmg|heal> <valor>
+// .classbalance spell reset <spell_id>
 using namespace Acore::ChatCommands;
 
 class ClassBalanceCommandScript : public CommandScript
@@ -350,6 +479,13 @@ public:
 
     ChatCommandTable GetCommands() const override
     {
+        static ChatCommandTable spellSub =
+        {
+            { "list",  HandleCBSpellList,  SEC_GAMEMASTER,    Console::No },
+            { "info",  HandleCBSpellInfo,  SEC_GAMEMASTER,    Console::No },
+            { "set",   HandleCBSpellSet,   SEC_ADMINISTRATOR, Console::No },
+            { "reset", HandleCBSpellReset, SEC_ADMINISTRATOR, Console::No },
+        };
         static ChatCommandTable sub =
         {
             { "list",   HandleCBList,   SEC_GAMEMASTER,    Console::No },
@@ -357,6 +493,7 @@ public:
             { "set",    HandleCBSet,    SEC_ADMINISTRATOR, Console::No },
             { "reset",  HandleCBReset,  SEC_ADMINISTRATOR, Console::No },
             { "reload", HandleCBReload, SEC_ADMINISTRATOR, Console::No },
+            { "spell",  spellSub },
         };
         static ChatCommandTable root = { { "classbalance", sub } };
         return root;
@@ -489,6 +626,129 @@ public:
         sClassBalance->LoadAll();
         handler->SendSysMessage(
             "|cff00ff00[ClassBalance]|r Multiplicadores recargados desde la BD.");
+        return true;
+    }
+
+    // ── .classbalance spell list ───────────────────────────────────────────────
+    static bool HandleCBSpellList(ChatHandler* handler)
+    {
+        if (!ClassBalanceMgr::IsEnabled())
+        {
+            handler->SendSysMessage("|cffff4444[ClassBalance]|r Módulo desactivado.");
+            return true;
+        }
+
+        QueryResult result = WorldDatabase.Query(
+            "SELECT `spell_id`, `dmg_mult`, `heal_mult`, `comment` "
+            "FROM `mod_class_balance_spells` ORDER BY `spell_id`");
+
+        if (!result)
+        {
+            handler->SendSysMessage(
+                "|cffffff00[ClassBalance]|r No hay hechizos con override configurado.");
+            return true;
+        }
+
+        handler->SendSysMessage("|cffffff00[ClassBalance]|r Overrides por hechizo:");
+        handler->SendSysMessage(
+            "|cffaaaaaa  SpellID     Daño   Curación  Comentario|r");
+
+        do
+        {
+            Field* f = result->Fetch();
+            uint32      spellId = f[0].Get<uint32>();
+            float       dmg     = f[1].Get<float>();
+            float       heal    = f[2].Get<float>();
+            std::string comment = f[3].Get<std::string>();
+
+            handler->PSendSysMessage(
+                "  |cff00ccff{:<10}|r  {:.2f}   {:.2f}    {}",
+                spellId, dmg, heal,
+                comment.empty() ? "-" : comment);
+        }
+        while (result->NextRow());
+
+        handler->SendSysMessage(
+            "|cffaaaaaa Usa .classbalance spell set <id> <dmg|heal> <valor>|r");
+        return true;
+    }
+
+    // ── .classbalance spell info <spell_id> ───────────────────────────────────
+    static bool HandleCBSpellInfo(ChatHandler* handler, uint32 spellId)
+    {
+        if (spellId == 0)
+        {
+            handler->SendSysMessage("|cffff4444[ClassBalance]|r spell_id inválido.");
+            return false;
+        }
+
+        auto const m = sClassBalance->GetSpellMult(spellId);
+        bool hasOverride = (std::fabs(m.dmgMult - 1.0f) > 0.001f ||
+                            std::fabs(m.healMult - 1.0f) > 0.001f);
+
+        handler->PSendSysMessage(
+            "|cffffff00[ClassBalance]|r Hechizo |cff00ccff{}|r:{}",
+            spellId, hasOverride ? "" : "  |cffaaaaaa(sin override – valores por defecto)|r");
+
+        handler->PSendSysMessage(
+            "  Daño      : |cff{}|r{:.2f}x",
+            (m.dmgMult > 1.0f ? "00ff00" : (m.dmgMult < 1.0f ? "ff4444" : "ffffff")),
+            m.dmgMult);
+        handler->PSendSysMessage(
+            "  Curación  : |cff{}|r{:.2f}x",
+            (m.healMult > 1.0f ? "00ff00" : (m.healMult < 1.0f ? "ff4444" : "ffffff")),
+            m.healMult);
+
+        return true;
+    }
+
+    // ── .classbalance spell set <spell_id> <tipo> <valor> ─────────────────────
+    static bool HandleCBSpellSet(ChatHandler* handler,
+                                 uint32 spellId,
+                                 std::string const& type,
+                                 float value)
+    {
+        if (spellId == 0)
+        {
+            handler->SendSysMessage("|cffff4444[ClassBalance]|r spell_id inválido.");
+            return false;
+        }
+
+        if (value < 0.0f || value > 100.0f)
+        {
+            handler->SendSysMessage(
+                "|cffff4444[ClassBalance]|r El valor debe estar entre 0.0 y 100.0.");
+            return false;
+        }
+
+        if (!sClassBalance->SetSpellMultiplier(spellId, type, value))
+        {
+            handler->PSendSysMessage(
+                "|cffff4444[ClassBalance]|r Tipo '{}' no válido. Usa: dmg | heal.", type);
+            return false;
+        }
+
+        handler->PSendSysMessage(
+            "|cff00ff00[ClassBalance]|r Hechizo |cff00ccff{}|r > {}: "
+            "|cffff8800{:.2f}x|r  (guardado en BD)",
+            spellId, type, value);
+        return true;
+    }
+
+    // ── .classbalance spell reset <spell_id> ──────────────────────────────────
+    static bool HandleCBSpellReset(ChatHandler* handler, uint32 spellId)
+    {
+        if (spellId == 0)
+        {
+            handler->SendSysMessage("|cffff4444[ClassBalance]|r spell_id inválido.");
+            return false;
+        }
+
+        sClassBalance->ResetSpell(spellId);
+
+        handler->PSendSysMessage(
+            "|cff00ff00[ClassBalance]|r Override del hechizo |cff00ccff{}|r eliminado.",
+            spellId);
         return true;
     }
 };

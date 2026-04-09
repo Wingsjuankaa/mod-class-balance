@@ -35,3 +35,32 @@ VALUES
     ( 9, 1.0, 1.0, 1.0, 1.0),  -- Brujo          (Warlock)
     (11, 1.0, 1.0, 1.0, 1.0);  -- Druida         (Druid)
 
+-- ============================================================
+-- Tabla de overrides por hechizo específico
+-- ============================================================
+-- Permite ajustar el multiplicador de daño o curación de
+-- un hechizo concreto (por su spell_id), de forma independiente
+-- al multiplicador de clase.
+-- Los multiplicadores se APILAN con los de clase:
+--   daño final = clase.spell_dmg × spell.dmg_mult
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS `mod_class_balance_spells` (
+    `spell_id`   INT UNSIGNED NOT NULL
+        COMMENT 'ID del hechizo en spell_dbc',
+    `dmg_mult`   FLOAT        NOT NULL DEFAULT 1.0
+        COMMENT 'Mult. de daño del hechizo (spell damage y DoTs). 0.8 = -20%',
+    `heal_mult`  FLOAT        NOT NULL DEFAULT 1.0
+        COMMENT 'Mult. de curación del hechizo. 1.2 = +20%',
+    `comment`    VARCHAR(128) NOT NULL DEFAULT ''
+        COMMENT 'Descripción opcional (ej: "Bola de fuego - Mago")',
+    PRIMARY KEY (`spell_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Overrides de balance por hechizo específico (mod-class-balance)';
+
+-- Ejemplos comentados (descomenta y ajusta según necesites):
+-- INSERT IGNORE INTO `mod_class_balance_spells` (`spell_id`, `dmg_mult`, `heal_mult`, `comment`)
+-- VALUES
+--   (133,   0.85, 1.0,  'Bola de fuego (Mago) – reducida 15%'),
+--   (48778, 0.90, 1.0,  'Toque de agonía (DK) – reducida 10%'),
+--   (48785, 1.0,  1.15, 'Destello de luz (Paladín) – +15% curación');

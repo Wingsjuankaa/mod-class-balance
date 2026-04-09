@@ -1,16 +1,15 @@
 ################################################################################
 # mod-class-balance – Ajuste de multiplicadores de combate por clase
 ################################################################################
-# Versión: 1.0.0
+# Versión: 1.1.0
 #
 # Permite ajustar el daño dado, el daño recibido y la curación de cada clase
 # de jugador de forma independiente, en caliente, mediante comandos de GM
-# o editando directamente la tabla `mod_class_balance` de acore_world.
+# o editando directamente las tablas de acore_world.
 #
-# Los valores se almacenan en la base de datos (mod_class_balance).
-# Este archivo solo controla si el módulo está activo.
-#
-# Comandos disponibles (requieren nivel GM):
+# ── BALANCE POR CLASE ─────────────────────────────────────────────────────────
+# Los valores se almacenan en mod_class_balance.
+# Comandos (requieren nivel GM):
 #   .classbalance list               – Muestra todos los multiplicadores
 #   .classbalance info <clase>       – Detalle de una clase
 #   .classbalance set <clase> <tipo> <valor>
@@ -24,6 +23,24 @@
 #   .classbalance set mage spell 0.90      → -10% daño hechizo a Magos
 #   .classbalance set paladin heal 1.10    → +10% curación de Paladines
 #   .classbalance set priest def 0.85      → Sacerdotes reciben 15% menos daño
+#
+# ── BALANCE POR HECHIZO ESPECÍFICO ────────────────────────────────────────────
+# Los overrides se almacenan en mod_class_balance_spells.
+# Los multiplicadores por hechizo se APILAN con los de clase:
+#   daño final = clase.spell_dmg × hechizo.dmg_mult
+#
+# Comandos:
+#   .classbalance spell list                      – Lista hechizos con override
+#   .classbalance spell info <spell_id>           – Detalle de un hechizo
+#   .classbalance spell set <spell_id> <tipo> <valor>
+#                                                 – tipos: dmg | heal
+#   .classbalance spell reset <spell_id>          – Elimina el override
+#
+# Ejemplos:
+#   .classbalance spell set 133 dmg 0.85     → Bola de fuego -15% daño
+#   .classbalance spell set 48778 dmg 0.90   → Toque de agonía -10%
+#   .classbalance spell set 48785 heal 1.20  → Destello de luz +20% curación
+#   .classbalance spell reset 133            → Elimina override de Bola de fuego
 #
 # Clases válidas (inglés o español):
 #   warrior/guerrero, paladin, hunter/cazador, rogue/picaro,
