@@ -7,6 +7,7 @@
 #include "Log.h"
 #include "ChatCommand.h"
 #include "StringFormat.h"
+#include "ThreatManager.h"
 #include <unordered_map>
 #include <mutex>
 #include <algorithm>
@@ -15,17 +16,19 @@
 // ─── Multiplicadores por clase ────────────────────────────────────────────────
 struct ClassMultipliers
 {
-    float physDmg  = 1.0f;
-    float spellDmg = 1.0f;
-    float healing  = 1.0f;
-    float defense  = 1.0f;
+    float physDmg   = 1.0f;  // Daño físico (melee/ranged) dado
+    float spellDmg  = 1.0f;  // Daño de hechizo y DoTs dado
+    float healing   = 1.0f;  // Curación hecha
+    float defense   = 1.0f;  // Daño recibido; 0.9 = 10% menos
+    float threatMult = 1.0f; // Amenaza generada (PvE); 1.5 = +50%
 };
 
 // ─── Multiplicadores por hechizo específico ───────────────────────────────────
 struct SpellMultiplier
 {
-    float dmgMult  = 1.0f;  // Daño (spell damage y DoTs) del hechizo
-    float healMult = 1.0f;  // Curación del hechizo
+    float dmgMult   = 1.0f;  // Daño (spell damage y DoTs) del hechizo
+    float healMult  = 1.0f;  // Curación del hechizo
+    float threatMult = 1.0f; // Amenaza del hechizo; 2.0 = doble amenaza
 };
 
 // ─── Manager ──────────────────────────────────────────────────────────────────
@@ -94,7 +97,6 @@ public:
         return 0;
     }
 
-
     // ── Obtener multiplicadores de una clase ───────────────────────────────────
     ClassMultipliers const& Get(uint8 classId) const
     {
@@ -114,19 +116,18 @@ public:
             _mults.clear();
         }
 
-        // Garantizar que existen filas para todas las clases (síncrono)
         static uint8 const classes[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
         for (uint8 c : classes)
         {
             WorldDatabase.DirectExecute(
                 "INSERT IGNORE INTO `mod_class_balance` "
-                "(`class_id`,`phys_dmg`,`spell_dmg`,`healing`,`defense`) "
-                "VALUES ({}, 1.0, 1.0, 1.0, 1.0)",
+                "(`class_id`,`phys_dmg`,`spell_dmg`,`healing`,`defense`,`threat_mult`) "
+                "VALUES ({}, 1.0, 1.0, 1.0, 1.0, 1.0)",
                 static_cast<uint32>(c));
         }
 
         QueryResult result = WorldDatabase.Query(
-            "SELECT `class_id`, `phys_dmg`, `spell_dmg`, `healing`, `defense` "
+            "SELECT `class_id`, `phys_dmg`, `spell_dmg`, `healing`, `defense`, `threat_mult` "
             "FROM `mod_class_balance` ORDER BY `class_id`");
 
         if (!result)
@@ -143,10 +144,11 @@ public:
             Field* f = result->Fetch();
             uint8 classId = f[0].Get<uint8>();
             ClassMultipliers m;
-            m.physDmg  = f[1].Get<float>();
-            m.spellDmg = f[2].Get<float>();
-            m.healing  = f[3].Get<float>();
-            m.defense  = f[4].Get<float>();
+            m.physDmg    = f[1].Get<float>();
+            m.spellDmg   = f[2].Get<float>();
+            m.healing    = f[3].Get<float>();
+            m.defense    = f[4].Get<float>();
+            m.threatMult = f[5].Get<float>();
             {
                 std::lock_guard<std::mutex> lock(_mutex);
                 _mults[classId] = m;
@@ -156,8 +158,6 @@ public:
         while (result->NextRow());
 
         LOG_INFO("module", "ClassBalance: {} clase(s) cargadas.", count);
-
-        // Cargar también los overrides por hechizo
         LoadAllSpells();
     }
 
@@ -170,7 +170,7 @@ public:
         }
 
         QueryResult result = WorldDatabase.Query(
-            "SELECT `spell_id`, `dmg_mult`, `heal_mult` "
+            "SELECT `spell_id`, `dmg_mult`, `heal_mult`, `threat_mult` "
             "FROM `mod_class_balance_spells`");
 
         if (!result)
@@ -185,8 +185,9 @@ public:
             Field* f = result->Fetch();
             uint32 spellId = f[0].Get<uint32>();
             SpellMultiplier m;
-            m.dmgMult  = f[1].Get<float>();
-            m.healMult = f[2].Get<float>();
+            m.dmgMult    = f[1].Get<float>();
+            m.healMult   = f[2].Get<float>();
+            m.threatMult = f[3].Get<float>();
             {
                 std::lock_guard<std::mutex> lock(_mutex);
                 _spellMults[spellId] = m;
@@ -198,9 +199,7 @@ public:
         LOG_INFO("module", "ClassBalance: {} hechizo(s) con override cargados.", count);
     }
 
-    // ── Ajusta un multiplicador, guarda en BD y actualiza caché ───────────────
-    // type: "phys" | "spell" | "heal" | "def"
-    // Devuelve false si el tipo o el classId no son válidos
+    // ── Ajusta un multiplicador de clase ──────────────────────────────────────
     bool SetMultiplier(uint8 classId, std::string const& type, float value)
     {
         if (classId == 0 || value < 0.0f || value > 100.0f)
@@ -209,26 +208,28 @@ public:
         std::string column;
         std::string t = type;
         std::transform(t.begin(), t.end(), t.begin(), ::tolower);
-        if (t == "phys"  || t == "fisico"  || t == "melee")    column = "phys_dmg";
-        else if (t == "spell" || t == "hechizo" || t == "magia") column = "spell_dmg";
-        else if (t == "heal"  || t == "cura" || t == "curacion") column = "healing";
-        else if (t == "def"   || t == "defense" || t == "defensa") column = "defense";
+        if (t == "phys"  || t == "fisico"  || t == "melee")          column = "phys_dmg";
+        else if (t == "spell" || t == "hechizo" || t == "magia")      column = "spell_dmg";
+        else if (t == "heal"  || t == "cura" || t == "curacion")      column = "healing";
+        else if (t == "def"   || t == "defense" || t == "defensa")    column = "defense";
+        else if (t == "threat" || t == "amenaza" || t == "aggro")     column = "threat_mult";
         else return false;
 
         WorldDatabase.DirectExecute(
             "INSERT INTO `mod_class_balance` "
-            "(`class_id`,`phys_dmg`,`spell_dmg`,`healing`,`defense`) "
-            "VALUES ({},1.0,1.0,1.0,1.0) "
+            "(`class_id`,`phys_dmg`,`spell_dmg`,`healing`,`defense`,`threat_mult`) "
+            "VALUES ({},1.0,1.0,1.0,1.0,1.0) "
             "ON DUPLICATE KEY UPDATE `{}` = {}",
             static_cast<uint32>(classId), column, value);
 
         {
             std::lock_guard<std::mutex> lock(_mutex);
             auto& m = _mults[classId];
-            if (column == "phys_dmg")  m.physDmg  = value;
-            if (column == "spell_dmg") m.spellDmg = value;
-            if (column == "healing")   m.healing  = value;
-            if (column == "defense")   m.defense  = value;
+            if (column == "phys_dmg")    m.physDmg    = value;
+            if (column == "spell_dmg")   m.spellDmg   = value;
+            if (column == "healing")     m.healing     = value;
+            if (column == "defense")     m.defense     = value;
+            if (column == "threat_mult") m.threatMult  = value;
         }
         return true;
     }
@@ -238,7 +239,7 @@ public:
     {
         WorldDatabase.DirectExecute(
             "UPDATE `mod_class_balance` SET "
-            "`phys_dmg`=1.0, `spell_dmg`=1.0, `healing`=1.0, `defense`=1.0 "
+            "`phys_dmg`=1.0, `spell_dmg`=1.0, `healing`=1.0, `defense`=1.0, `threat_mult`=1.0 "
             "WHERE `class_id`={}",
             static_cast<uint32>(classId));
         {
@@ -248,11 +249,10 @@ public:
     }
 
     // ── Comprueba si debe aplicarse según el tipo de combate ──────────────────
-    // attacker puede ser nullptr (DoTs sin atacante vivo)
     static bool ShouldApply(Unit const* attacker, Unit const* victim)
     {
         if (!attacker || !victim)
-            return true; // conservador: sí aplica
+            return true;
 
         bool attackerIsPlayer = (attacker->GetTypeId() == TYPEID_PLAYER);
         bool victimIsPlayer   = (victim->GetTypeId()   == TYPEID_PLAYER);
@@ -275,8 +275,7 @@ public:
         return SpellMultiplier{};
     }
 
-    // ── Ajusta un multiplicador de hechizo, guarda en BD y actualiza caché ───
-    // type: "dmg" | "heal"
+    // ── Ajusta un multiplicador de hechizo ────────────────────────────────────
     bool SetSpellMultiplier(uint32 spellId, std::string const& type, float value)
     {
         if (spellId == 0 || value < 0.0f || value > 100.0f)
@@ -291,21 +290,24 @@ public:
             column = "dmg_mult";
         else if (t == "heal" || t == "cura" || t == "curacion" || t == "curación")
             column = "heal_mult";
+        else if (t == "threat" || t == "amenaza" || t == "aggro")
+            column = "threat_mult";
         else
             return false;
 
         WorldDatabase.DirectExecute(
             "INSERT INTO `mod_class_balance_spells` "
-            "(`spell_id`,`dmg_mult`,`heal_mult`) "
-            "VALUES ({},1.0,1.0) "
+            "(`spell_id`,`dmg_mult`,`heal_mult`,`threat_mult`) "
+            "VALUES ({},1.0,1.0,1.0) "
             "ON DUPLICATE KEY UPDATE `{}` = {}",
             spellId, column, value);
 
         {
             std::lock_guard<std::mutex> lock(_mutex);
             auto& m = _spellMults[spellId];
-            if (column == "dmg_mult")  m.dmgMult  = value;
-            if (column == "heal_mult") m.healMult = value;
+            if (column == "dmg_mult")    m.dmgMult    = value;
+            if (column == "heal_mult")   m.healMult   = value;
+            if (column == "threat_mult") m.threatMult = value;
         }
         return true;
     }
@@ -330,7 +332,34 @@ private:
 
 #define sClassBalance ClassBalanceMgr::instance()
 
-// ─── Script de mundo (carga al iniciar) ──────────────────────────────────────
+// ─── Ayuda interna: inyecta amenaza extra en la criatura ─────────────────────
+// Se llama desde los hooks de daño DESPUÉS de haber modificado `damage`.
+// extraThreat = damage_modificado * (threatMult - 1.0)
+// → el juego añade damage_modificado * 1.0 de amenaza normal después del hook.
+// → total amenaza = damage_modificado * threatMult  ✓
+static void AddExtraThreat(Unit* target, Unit* attacker,
+                           float damage, float classThreatMult,
+                           float spellThreatMult = 1.0f)
+{
+    // Solo PvE: el atacante es jugador y la víctima NO es jugador
+    if (!attacker || attacker->GetTypeId() != TYPEID_PLAYER)
+        return;
+    if (!target || target->GetTypeId() == TYPEID_PLAYER)
+        return;
+    if (!target->GetThreatMgr().CanHaveThreatList())
+        return;
+
+    float totalThreatMult = classThreatMult * spellThreatMult;
+    if (std::fabs(totalThreatMult - 1.0f) <= 0.001f)
+        return;
+
+    float extraThreat = damage * (totalThreatMult - 1.0f);
+    // AddThreat con ignoreModifiers=true para que no se dupliquen modificadores
+    // ignoreRedirects=false para que el redireccionamiento de amenaza funcione
+    target->GetThreatMgr().AddThreat(attacker, extraThreat, nullptr, true, false);
+}
+
+// ─── Script de mundo ──────────────────────────────────────────────────────────
 class ClassBalanceWorldScript : public WorldScript
 {
 public:
@@ -364,16 +393,21 @@ public:
 
         float mult = 1.0f;
 
-        // Multiplicador de daño dado por la clase atacante
         if (attacker && attacker->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(attacker->getClass()).physDmg;
 
-        // Multiplicador de daño recibido por la clase víctima
         if (target && target->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(target->getClass()).defense;
 
         if (std::fabs(mult - 1.0f) > 0.001f)
             damage = static_cast<uint32>(static_cast<float>(damage) * mult);
+
+        // Amenaza extra (melee no tiene spellInfo, solo aplica mult de clase)
+        if (attacker && attacker->GetTypeId() == TYPEID_PLAYER)
+        {
+            float threatMult = sClassBalance->Get(attacker->getClass()).threatMult;
+            AddExtraThreat(target, attacker, static_cast<float>(damage), threatMult);
+        }
     }
 
     // ── Daño de hechizo ───────────────────────────────────────────────────────
@@ -393,16 +427,26 @@ public:
         if (target && target->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(target->getClass()).defense;
 
-        // Override por hechizo específico (se apila con el multiplicador de clase)
+        // Override de daño por hechizo específico
         if (spellInfo)
         {
-            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
-            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
-                mult *= spellSpecific;
+            float spellDmg = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
+            if (std::fabs(spellDmg - 1.0f) > 0.001f)
+                mult *= spellDmg;
         }
 
         if (std::fabs(mult - 1.0f) > 0.001f)
             damage = static_cast<int32>(static_cast<float>(damage) * mult);
+
+        // Amenaza extra
+        if (attacker && attacker->GetTypeId() == TYPEID_PLAYER)
+        {
+            float classThreat = sClassBalance->Get(attacker->getClass()).threatMult;
+            float spellThreat = spellInfo
+                ? sClassBalance->GetSpellMult(spellInfo->Id).threatMult
+                : 1.0f;
+            AddExtraThreat(target, attacker, static_cast<float>(damage), classThreat, spellThreat);
+        }
     }
 
     // ── Daño periódico (DoTs) ─────────────────────────────────────────────────
@@ -423,16 +467,26 @@ public:
         if (target && target->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(target->getClass()).defense;
 
-        // Override por hechizo específico
+        // Override de daño por hechizo específico
         if (spellInfo)
         {
-            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
-            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
-                mult *= spellSpecific;
+            float spellDmg = sClassBalance->GetSpellMult(spellInfo->Id).dmgMult;
+            if (std::fabs(spellDmg - 1.0f) > 0.001f)
+                mult *= spellDmg;
         }
 
         if (std::fabs(mult - 1.0f) > 0.001f)
             damage = static_cast<uint32>(static_cast<float>(damage) * mult);
+
+        // Amenaza extra
+        if (attacker && attacker->GetTypeId() == TYPEID_PLAYER)
+        {
+            float classThreat = sClassBalance->Get(attacker->getClass()).threatMult;
+            float spellThreat = spellInfo
+                ? sClassBalance->GetSpellMult(spellInfo->Id).threatMult
+                : 1.0f;
+            AddExtraThreat(target, attacker, static_cast<float>(damage), classThreat, spellThreat);
+        }
     }
 
     // ── Curación ──────────────────────────────────────────────────────────────
@@ -447,12 +501,11 @@ public:
         if (healer && healer->GetTypeId() == TYPEID_PLAYER)
             mult *= sClassBalance->Get(healer->getClass()).healing;
 
-        // Override por hechizo específico
         if (spellInfo)
         {
-            float spellSpecific = sClassBalance->GetSpellMult(spellInfo->Id).healMult;
-            if (std::fabs(spellSpecific - 1.0f) > 0.001f)
-                mult *= spellSpecific;
+            float spellHeal = sClassBalance->GetSpellMult(spellInfo->Id).healMult;
+            if (std::fabs(spellHeal - 1.0f) > 0.001f)
+                mult *= spellHeal;
         }
 
         if (std::fabs(mult - 1.0f) > 0.001f)
@@ -463,12 +516,12 @@ public:
 // ─── CommandScript ────────────────────────────────────────────────────────────
 // .classbalance list
 // .classbalance info <clase>
-// .classbalance set <clase> <tipo> <valor>
+// .classbalance set <clase> <tipo> <valor>   tipos: phys|spell|heal|def|threat
 // .classbalance reset <clase>
 // .classbalance reload
 // .classbalance spell list
 // .classbalance spell info <spell_id>
-// .classbalance spell set <spell_id> <dmg|heal> <valor>
+// .classbalance spell set <spell_id> <dmg|heal|threat> <valor>
 // .classbalance spell reset <spell_id>
 using namespace Acore::ChatCommands;
 
@@ -504,29 +557,27 @@ public:
     {
         if (!ClassBalanceMgr::IsEnabled())
         {
-            handler->SendSysMessage(
-                "|cffff4444[ClassBalance]|r Módulo desactivado.");
+            handler->SendSysMessage("|cffff4444[ClassBalance]|r Módulo desactivado.");
             return true;
         }
 
         static uint8 const classes[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
 
+        handler->SendSysMessage("|cffffff00[ClassBalance]|r Multiplicadores actuales:");
         handler->SendSysMessage(
-            "|cffffff00[ClassBalance]|r Multiplicadores actuales:");
-        handler->SendSysMessage(
-            "|cffaaaaaa  Clase              Físico  Hechizo  Curación  Defensa|r");
+            "|cffaaaaaa  Clase              Físico  Hechizo  Curación  Defensa  Amenaza|r");
 
         for (uint8 c : classes)
         {
             auto const& m = sClassBalance->Get(c);
             handler->PSendSysMessage(
-                "  |cff00ccff{:<17}|r  {:.2f}   {:.2f}    {:.2f}     {:.2f}",
+                "  |cff00ccff{:<17}|r  {:.2f}   {:.2f}    {:.2f}     {:.2f}    {:.2f}",
                 ClassBalanceMgr::GetClassName(c),
-                m.physDmg, m.spellDmg, m.healing, m.defense);
+                m.physDmg, m.spellDmg, m.healing, m.defense, m.threatMult);
         }
 
         handler->SendSysMessage(
-            "|cffaaaaaa Usa .classbalance set <clase> <phys|spell|heal|def> <valor>|r");
+            "|cffaaaaaa Usa .classbalance set <clase> <phys|spell|heal|def|threat> <valor>|r");
         return true;
     }
 
@@ -562,6 +613,10 @@ public:
             "  Daño recibido (def): |cff{}|r{:.2f}x  |cffaaaaaa(menor = más defensa)|r",
             (m.defense < 1.0f ? "00ff00" : (m.defense > 1.0f ? "ff4444" : "ffffff")),
             m.defense);
+        handler->PSendSysMessage(
+            "  Amenaza generada   : |cff{}|r{:.2f}x  |cffaaaaaa(solo PvE)|r",
+            (m.threatMult > 1.0f ? "00ff00" : (m.threatMult < 1.0f ? "ff4444" : "ffffff")),
+            m.threatMult);
         return true;
     }
 
@@ -590,7 +645,7 @@ public:
         {
             handler->PSendSysMessage(
                 "|cffff4444[ClassBalance]|r Tipo '{}' no válido. "
-                "Usa: phys | spell | heal | def.", type);
+                "Usa: phys | spell | heal | def | threat.", type);
             return false;
         }
 
@@ -639,7 +694,7 @@ public:
         }
 
         QueryResult result = WorldDatabase.Query(
-            "SELECT `spell_id`, `dmg_mult`, `heal_mult`, `comment` "
+            "SELECT `spell_id`, `dmg_mult`, `heal_mult`, `threat_mult`, `comment` "
             "FROM `mod_class_balance_spells` ORDER BY `spell_id`");
 
         if (!result)
@@ -651,7 +706,7 @@ public:
 
         handler->SendSysMessage("|cffffff00[ClassBalance]|r Overrides por hechizo:");
         handler->SendSysMessage(
-            "|cffaaaaaa  SpellID     Daño   Curación  Comentario|r");
+            "|cffaaaaaa  SpellID     Daño   Curación  Amenaza  Comentario|r");
 
         do
         {
@@ -659,17 +714,18 @@ public:
             uint32      spellId = f[0].Get<uint32>();
             float       dmg     = f[1].Get<float>();
             float       heal    = f[2].Get<float>();
-            std::string comment = f[3].Get<std::string>();
+            float       threat  = f[3].Get<float>();
+            std::string comment = f[4].Get<std::string>();
 
             handler->PSendSysMessage(
-                "  |cff00ccff{:<10}|r  {:.2f}   {:.2f}    {}",
-                spellId, dmg, heal,
+                "  |cff00ccff{:<10}|r  {:.2f}   {:.2f}    {:.2f}    {}",
+                spellId, dmg, heal, threat,
                 comment.empty() ? "-" : comment);
         }
         while (result->NextRow());
 
         handler->SendSysMessage(
-            "|cffaaaaaa Usa .classbalance spell set <id> <dmg|heal> <valor>|r");
+            "|cffaaaaaa Usa .classbalance spell set <id> <dmg|heal|threat> <valor>|r");
         return true;
     }
 
@@ -683,8 +739,9 @@ public:
         }
 
         auto const m = sClassBalance->GetSpellMult(spellId);
-        bool hasOverride = (std::fabs(m.dmgMult - 1.0f) > 0.001f ||
-                            std::fabs(m.healMult - 1.0f) > 0.001f);
+        bool hasOverride = (std::fabs(m.dmgMult    - 1.0f) > 0.001f ||
+                            std::fabs(m.healMult   - 1.0f) > 0.001f ||
+                            std::fabs(m.threatMult - 1.0f) > 0.001f);
 
         handler->PSendSysMessage(
             "|cffffff00[ClassBalance]|r Hechizo |cff00ccff{}|r:{}",
@@ -698,6 +755,10 @@ public:
             "  Curación  : |cff{}|r{:.2f}x",
             (m.healMult > 1.0f ? "00ff00" : (m.healMult < 1.0f ? "ff4444" : "ffffff")),
             m.healMult);
+        handler->PSendSysMessage(
+            "  Amenaza   : |cff{}|r{:.2f}x  |cffaaaaaa(solo PvE)|r",
+            (m.threatMult > 1.0f ? "00ff00" : (m.threatMult < 1.0f ? "ff4444" : "ffffff")),
+            m.threatMult);
 
         return true;
     }
@@ -724,7 +785,8 @@ public:
         if (!sClassBalance->SetSpellMultiplier(spellId, type, value))
         {
             handler->PSendSysMessage(
-                "|cffff4444[ClassBalance]|r Tipo '{}' no válido. Usa: dmg | heal.", type);
+                "|cffff4444[ClassBalance]|r Tipo '{}' no válido. "
+                "Usa: dmg | heal | threat.", type);
             return false;
         }
 
